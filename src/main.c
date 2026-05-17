@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/assigned_numbers.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
@@ -29,6 +30,8 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
 #define SLOW_BLINK_HALF_MS 250
 #define FAST_BLINK_HALF_MS 100
 #define DATA_FLASH_WINDOW_MS 350
+#define RX_LOG_INTERVAL_MS 1000
+#define APP_LOG_INTERVAL_MS 2000
 #define CADENCE_STALE_MS 900
 #define CADENCE_MAX_RPM 220
 #define CADENCE_MIN_STEP_DEG 2
@@ -95,6 +98,7 @@ static uint16_t last_crank_event_time_1024;
 static uint32_t last_crank_update_ms;
 static uint32_t last_app_notify_ms;
 static uint32_t last_app_log_ms;
+static uint32_t last_rx_log_ms;
 
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad);
@@ -115,6 +119,8 @@ static ssize_t read_cps_measurement(struct bt_conn *conn, const struct bt_gatt_a
 				    void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_sensor_location(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				    void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_csc_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				    void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_csc_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -126,7 +132,9 @@ BT_GATT_SERVICE_DEFINE(cps_svc,
 			       BT_GATT_PERM_READ, read_cps_measurement, NULL, NULL),
 	BT_GATT_CCC(cps_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 	BT_GATT_CHARACTERISTIC(BT_UUID_GATT_CPS_CPF, BT_GATT_CHRC_READ,
-			       BT_GATT_PERM_READ, read_cps_feature, NULL, NULL));
+			       BT_GATT_PERM_READ, read_cps_feature, NULL, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_SENSOR_LOCATION, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_sensor_location, NULL, NULL));
 
 BT_GATT_SERVICE_DEFINE(csc_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_CSC),
@@ -134,7 +142,9 @@ BT_GATT_SERVICE_DEFINE(csc_svc,
 			       BT_GATT_PERM_READ, read_csc_measurement, NULL, NULL),
 	BT_GATT_CCC(csc_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 	BT_GATT_CHARACTERISTIC(BT_UUID_CSC_FEATURE, BT_GATT_CHRC_READ,
-			       BT_GATT_PERM_READ, read_csc_feature, NULL, NULL));
+			       BT_GATT_PERM_READ, read_csc_feature, NULL, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_SENSOR_LOCATION, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_sensor_location, NULL, NULL));
 
 static void update_crank_metrics(uint16_t cadence_rpm, uint32_t now_ms)
 {
@@ -298,6 +308,15 @@ static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &features, sizeof(features));
 }
 
+static ssize_t read_sensor_location(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				    void *buf, uint16_t len, uint16_t offset)
+{
+	uint8_t sensor_location = 0x05; /* Left crank */
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset,
+				 &sensor_location, sizeof(sensor_location));
+}
+
 static ssize_t read_csc_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				    void *buf, uint16_t len, uint16_t offset)
 {
@@ -364,7 +383,7 @@ static void notify_ble_apps_if_due(void)
 		any_notified = true;
 	}
 
-	if (any_notified && (now - last_app_log_ms) >= 1000U) {
+	if (any_notified && (now - last_app_log_ms) >= APP_LOG_INTERVAL_MS) {
 		printf("APP TX P=%uW C=%urpm rev=%lu t=%u\n",
 		       pwr, cad, (unsigned long)cumulative_crank_revs, last_crank_event_time_1024);
 		last_app_log_ms = now;
@@ -629,8 +648,12 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	accumulated_power = (uint16_t)(accumulated_power + total_power);
 	k_mutex_unlock(&data_lock);
 
-	printf("RX P=%uW C=%urpm E=%u (L=%d R=%d A=%u CA=%u)\n",
-	       total_power, cadence_calc, err_code, left_power, right_power, angle_deg, crank_angle_deg);
+	if ((now - last_rx_log_ms) >= RX_LOG_INTERVAL_MS) {
+		printf("RX P=%uW C=%urpm E=%u (L=%d R=%d A=%u CA=%u)\n",
+		       total_power, cadence_calc, err_code, left_power, right_power, angle_deg,
+		       crank_angle_deg);
+		last_rx_log_ms = now;
+	}
 	return BT_GATT_ITER_CONTINUE;
 }
 
@@ -733,6 +756,7 @@ static int start_advertising(void)
 		BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 		BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 			sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+		BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, BT_UUID_16_ENCODE(BT_APPEARANCE_CYCLING_POWER)),
 		BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0x18, 0x18, 0x16, 0x18),
 	};
 
