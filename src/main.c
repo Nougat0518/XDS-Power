@@ -24,80 +24,108 @@
 #include <ant_parameters.h>
 #include <ant_profiles/bpwr/ant_bpwr.h>
 
-LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_WRN);
 
+/** @brief BLE 数据超时阈值（ms），超时后 ANT 输出清零。 */
 #define DATA_TIMEOUT_MS 5000
+/** @brief 慢闪半周期（ms），用于状态指示灯闪烁节奏。 */
 #define SLOW_BLINK_HALF_MS 250
-#define FAST_BLINK_HALF_MS 100
-#define DATA_FLASH_WINDOW_MS 350
+/** @brief 串口接收数据日志输出周期（ms）。 */
 #define RX_LOG_INTERVAL_MS 1000
+/** @brief APP 转发日志输出周期（ms）。 */
 #define APP_LOG_INTERVAL_MS 2000
-#define CADENCE_STALE_MS 900
-#define CADENCE_MAX_RPM 220
-#define CADENCE_MIN_STEP_DEG 2
-#define CADENCE_MAX_STEP_DEG 120
-#define CADENCE_COMP_X10 18
+/** @brief BLE APP 通知发送周期（ms）。 */
 #define APP_NOTIFY_INTERVAL_MS 200
 
+/** @brief XDS 功率计服务 UUID（16-bit）。 */
 #define XDS_SERVICE_UUID_16 0x1828
+/** @brief XDS 功率计测量特征 UUID（16-bit）。 */
 #define XDS_MEAS_UUID_16 0x2A63
 
+/** @brief 板载 LED0（P0.12）。 */
 #define LED0_NODE DT_ALIAS(led0)
+/** @brief 板载 LED1（P1.09）。 */
 #define LED1_NODE DT_ALIAS(led1)
+/** @brief 板载 LED2（P0.04），用于 BLE 外设连接状态指示。 */
 #define LED2_NODE DT_ALIAS(led2)
 
+/** @brief 串口命令缓冲区长度。 */
 #define CMD_BUF_LEN 64
+/** @brief 无换行命令的自动执行空闲时间（ms）。 */
 #define CMD_IDLE_EXEC_MS 1200
 
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(LED2_NODE, gpios);
 
+/** @brief 控制台串口设备。 */
 static const struct device *uart_console;
+/** @brief 串口命令缓存。 */
 static char cmd_buf[CMD_BUF_LEN];
+/** @brief 当前已接收命令长度。 */
 static size_t cmd_len;
+/** @brief 串口最后一次接收字符时间戳（ms）。 */
 static uint32_t cmd_last_rx_ms;
 
+/** @brief 当前与 XDS 连接对象（中央角色）。 */
 static struct bt_conn *sensor_conn;
+/** @brief GATT 发现参数。 */
 static struct bt_gatt_discover_params discover_params;
+/** @brief GATT 订阅参数。 */
 static struct bt_gatt_subscribe_params subscribe_params;
+/** @brief 动态发现用 16-bit UUID 容器。 */
 static struct bt_uuid_16 discover_uuid;
+/** @brief 目标服务起始句柄。 */
 static uint16_t service_start_handle;
+/** @brief 目标服务结束句柄。 */
 static uint16_t service_end_handle;
 
+/** @brief BLE 数据共享锁（通知回调与主循环共享）。 */
 static struct k_mutex data_lock;
+/** @brief 最新总功率（W）。 */
 static uint16_t latest_power_w;
+/** @brief 最新左腿功率（W）。 */
 static int16_t latest_left_power_w;
+/** @brief 最新右腿功率（W）。 */
 static int16_t latest_right_power_w;
+/** @brief 最新踏频（rpm）。 */
 static uint16_t latest_cadence;
+/** @brief 最新错误码。 */
 static uint8_t latest_error_code;
+/** @brief 最后收到 BLE 数据时间戳（ms）。 */
 static uint32_t last_ble_data_ms;
-static uint32_t last_data_change_ms;
+/** @brief 上一包 BLE 到达时间戳（ms）。 */
 static uint32_t last_rx_packet_ms;
+/** @brief BLE 包间隔平滑均值（ms）。 */
 static uint32_t rx_avg_interval_ms;
+/** @brief 功率事件计数（ANT page16 event count）。 */
 static uint8_t pwr_event_count;
+/** @brief 累计功率（ANT page16 accumulated power）。 */
 static uint16_t accumulated_power;
+/** @brief CPS 通知是否已被 APP 订阅。 */
 static bool cps_notify_enabled;
+/** @brief CSCS 通知是否已被 APP 订阅。 */
 static bool csc_notify_enabled;
-static bool cadence_state_valid;
-static uint16_t cadence_prev_angle_deg;
-static uint32_t cadence_prev_ms;
-static uint16_t cadence_est_rpm;
-static uint32_t cadence_last_motion_ms;
-static uint16_t cadence_cfg_stale_ms = CADENCE_STALE_MS;
-static uint16_t cadence_cfg_min_step_deg = CADENCE_MIN_STEP_DEG;
-static uint16_t cadence_cfg_max_step_deg = CADENCE_MAX_STEP_DEG;
-static uint16_t cadence_cfg_comp_x10 = CADENCE_COMP_X10;
 
+/** @brief 是否扫描到目标 XDS 设备。 */
 static bool ble_seen_sensor;
+/** @brief 是否已连接 XDS 设备。 */
 static bool ble_connected_sensor;
+/** @brief 是否有手机 APP 连接到本机外设。 */
 static bool ble_periph_connected;
+/** @brief 是否检测到 ANT 码表已链路建立。 */
 static bool ant_linked_display;
+/** @brief 累计曲柄转数（供 CPS/CSCS）。 */
 static uint32_t cumulative_crank_revs;
+/** @brief 上次曲柄事件时间（1/1024s，16-bit 回卷）。 */
 static uint16_t last_crank_event_time_1024;
+/** @brief 曲柄更新参考时间戳（ms）。 */
 static uint32_t last_crank_update_ms;
+/** @brief 上次向 APP 发送通知时间戳（ms）。 */
 static uint32_t last_app_notify_ms;
+/** @brief 上次 APP 转发日志时间戳（ms）。 */
 static uint32_t last_app_log_ms;
+/** @brief 上次 RX 日志时间戳（ms）。 */
 static uint32_t last_rx_log_ms;
 
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
@@ -146,6 +174,12 @@ BT_GATT_SERVICE_DEFINE(csc_svc,
 	BT_GATT_CHARACTERISTIC(BT_UUID_SENSOR_LOCATION, BT_GATT_CHRC_READ,
 			       BT_GATT_PERM_READ, read_sensor_location, NULL, NULL));
 
+/**
+ * @brief 根据当前踏频更新曲柄累计圈数与事件时间。
+ *
+ * @param cadence_rpm 当前瞬时踏频（rpm）。
+ * @param now_ms 当前系统毫秒计时。
+ */
 static void update_crank_metrics(uint16_t cadence_rpm, uint32_t now_ms)
 {
 	uint32_t per_rev_ms;
@@ -180,6 +214,15 @@ static void update_crank_metrics(uint16_t cadence_rpm, uint32_t now_ms)
 	}
 }
 
+/**
+ * @brief 组装 CPS 测量包（功率+曲柄数据）。
+ *
+ * @param power_w 当前功率（W）。
+ * @param cadence_rpm 当前踏频（rpm）。
+ * @param out 输出缓冲区。
+ *
+ * @return 数据包长度（字节）。
+ */
 static size_t build_cps_measurement(uint16_t power_w, uint16_t cadence_rpm, uint8_t out[8])
 {
 	int16_t power_s16 = (power_w > INT16_MAX) ? INT16_MAX : (int16_t)power_w;
@@ -194,6 +237,14 @@ static size_t build_cps_measurement(uint16_t power_w, uint16_t cadence_rpm, uint
 	return 8U;
 }
 
+/**
+ * @brief 组装 CSCS 测量包（曲柄数据）。
+ *
+ * @param cadence_rpm 当前踏频（rpm）。
+ * @param out 输出缓冲区。
+ *
+ * @return 数据包长度（字节）。
+ */
 static size_t build_csc_measurement(uint16_t cadence_rpm, uint8_t out[5])
 {
 	uint32_t now = k_uptime_get_32();
@@ -203,78 +254,6 @@ static size_t build_csc_measurement(uint16_t cadence_rpm, uint8_t out[5])
 	sys_put_le16((uint16_t)cumulative_crank_revs, out + 1);
 	sys_put_le16(last_crank_event_time_1024, out + 3);
 	return 5U;
-}
-
-static uint16_t __unused cadence_from_angle(uint16_t crank_angle_deg, uint32_t now_ms)
-{
-	uint32_t dt_ms;
-	uint16_t delta_cw;
-	uint16_t delta_ccw;
-	uint16_t delta_deg;
-	uint32_t rpm_instant;
-	uint32_t rpm_comp;
-
-	if (!cadence_state_valid) {
-		cadence_state_valid = true;
-		cadence_prev_angle_deg = crank_angle_deg;
-		cadence_prev_ms = now_ms;
-		cadence_est_rpm = 0U;
-		cadence_last_motion_ms = now_ms;
-		return 0U;
-	}
-
-	dt_ms = now_ms - cadence_prev_ms;
-	if (dt_ms == 0U || dt_ms > DATA_TIMEOUT_MS) {
-		cadence_prev_angle_deg = crank_angle_deg;
-		cadence_prev_ms = now_ms;
-		cadence_est_rpm = 0U;
-		cadence_last_motion_ms = now_ms;
-		return 0U;
-	}
-
-	delta_cw = (uint16_t)((crank_angle_deg + 360U - cadence_prev_angle_deg) % 360U);
-	delta_ccw = (uint16_t)((cadence_prev_angle_deg + 360U - crank_angle_deg) % 360U);
-	/* Use shortest angular travel magnitude, so occasional reverse pedaling is handled. */
-	delta_deg = MIN(delta_cw, delta_ccw);
-	cadence_prev_angle_deg = crank_angle_deg;
-	cadence_prev_ms = now_ms;
-
-	/* Treat implausible jump as no movement. */
-	if (delta_deg > cadence_cfg_max_step_deg) {
-		delta_deg = 0U;
-	}
-
-	if (delta_deg >= cadence_cfg_min_step_deg) {
-		cadence_last_motion_ms = now_ms;
-	}
-
-	if ((now_ms - cadence_last_motion_ms) > cadence_cfg_stale_ms) {
-		cadence_est_rpm = 0U;
-		return 0U;
-	}
-
-	if (delta_deg < cadence_cfg_min_step_deg) {
-		return cadence_est_rpm;
-	}
-
-	/* 1Hz source: use per-packet estimate and apply cadence-only compensation. */
-	rpm_instant = ((uint32_t)delta_deg * 60000U) / (360U * dt_ms);
-	rpm_comp = (rpm_instant * cadence_cfg_comp_x10 + 5U) / 10U;
-	if (rpm_comp > CADENCE_MAX_RPM) {
-		rpm_comp = CADENCE_MAX_RPM;
-	}
-
-	/* Moderate smoothing: keep response while reducing packet jitter. */
-	cadence_est_rpm = (cadence_est_rpm == 0U) ? (uint16_t)rpm_comp :
-			  (uint16_t)((cadence_est_rpm + rpm_comp * 2U) / 3U);
-	return cadence_est_rpm;
-}
-
-static void print_cadence_cfg(void)
-{
-	printf("cad cfg: gain=%u.%u min_step=%u max_step=%u stale=%ums\n",
-	       cadence_cfg_comp_x10 / 10U, cadence_cfg_comp_x10 % 10U,
-	       cadence_cfg_min_step_deg, cadence_cfg_max_step_deg, cadence_cfg_stale_ms);
 }
 
 static ssize_t read_cps_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -346,6 +325,11 @@ static ssize_t read_csc_feature(struct bt_conn *conn, const struct bt_gatt_attr 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &features, sizeof(features));
 }
 
+/**
+ * @brief 按固定节拍向已订阅的 APP 发送 CPS/CSCS 通知。
+ *
+ * 为降低 CPU 与链路开销，统一限频到 APP_NOTIFY_INTERVAL_MS。
+ */
 static void notify_ble_apps_if_due(void)
 {
 	uint8_t cpm[8];
@@ -390,6 +374,9 @@ static void notify_ble_apps_if_due(void)
 	}
 }
 
+/**
+ * @brief 打印当前桥接状态（串口命令 status）。
+ */
 static void print_status(void)
 {
 	uint32_t age_ms = 0;
@@ -409,101 +396,33 @@ static void print_status(void)
 	k_mutex_unlock(&data_lock);
 }
 
+/**
+ * @brief 处理串口命令入口。
+ *
+ * @param cmd 已解析完成的一行命令字符串。
+ */
 static void handle_command(const char *cmd)
 {
-	char key[16];
-	unsigned int value;
-	int n;
-
-	n = sscanf(cmd, "%15s %u", key, &value);
-	if (n < 1) {
+	if (strcmp(cmd, "help") == 0) {
+		printf("commands: help, status, scan\n");
 		return;
 	}
-
-	if (strcmp(key, "help") == 0) {
-		printf("commands: help, status, scan, cad_show, cad_gain <x10>, cad_min <deg>, cad_max <deg>, cad_stale <ms>\n");
-		return;
-	}
-	if (strcmp(key, "status") == 0) {
+	if (strcmp(cmd, "status") == 0) {
 		print_status();
 		return;
 	}
-	if (strcmp(key, "scan") == 0) {
+	if (strcmp(cmd, "scan") == 0) {
 		(void)bt_le_scan_stop();
 		(void)bt_le_scan_start(BT_LE_SCAN_ACTIVE, device_found);
 		printf("scan restart requested\n");
 		return;
 	}
-	/* Serial tool occasionally truncates the last char; accept both forms. */
-	if (strcmp(key, "cad_show") == 0 || strcmp(key, "cad_sho") == 0) {
-		print_cadence_cfg();
-		return;
-	}
-	if (strcmp(key, "cad_gain") == 0 || strcmp(key, "cad_gai") == 0) {
-		if (n != 2) {
-			/* Fallback for serial links that lose the numeric suffix. */
-			cadence_cfg_comp_x10 = 30U;
-			printf("cad_gain fallback -> 30 (3.0x)\n");
-			print_cadence_cfg();
-			return;
-		}
-		if (value < 5U || value > 40U) {
-			printf("cad_gain range: 5..40 (0.5x..4.0x)\n");
-			return;
-		}
-		cadence_cfg_comp_x10 = (uint16_t)value;
-		print_cadence_cfg();
-		return;
-	}
-	if (strcmp(key, "cad_min") == 0 || strcmp(key, "cad_mi") == 0) {
-		if (n != 2) {
-			cadence_cfg_min_step_deg = 1U;
-			printf("cad_min fallback -> 1 deg\n");
-			print_cadence_cfg();
-			return;
-		}
-		if (value < 1U || value > 30U) {
-			printf("cad_min range: 1..30 deg\n");
-			return;
-		}
-		cadence_cfg_min_step_deg = (uint16_t)value;
-		print_cadence_cfg();
-		return;
-	}
-	if (strcmp(key, "cad_max") == 0 || strcmp(key, "cad_ma") == 0) {
-		if (n != 2) {
-			cadence_cfg_max_step_deg = 180U;
-			printf("cad_max fallback -> 180 deg\n");
-			print_cadence_cfg();
-			return;
-		}
-		if (value < 20U || value > 180U) {
-			printf("cad_max range: 20..180 deg\n");
-			return;
-		}
-		cadence_cfg_max_step_deg = (uint16_t)value;
-		print_cadence_cfg();
-		return;
-	}
-	if (strcmp(key, "cad_stale") == 0 || strcmp(key, "cad_stal") == 0 ||
-	    strcmp(key, "cad_sta") == 0) {
-		if (n != 2) {
-			cadence_cfg_stale_ms = 2500U;
-			printf("cad_stale fallback -> 2500 ms\n");
-			print_cadence_cfg();
-			return;
-		}
-		if (value < 300U || value > 5000U) {
-			printf("cad_stale range: 300..5000 ms\n");
-			return;
-		}
-		cadence_cfg_stale_ms = (uint16_t)value;
-		print_cadence_cfg();
-		return;
-	}
 	printf("unknown command: %s\n", cmd);
 }
 
+/**
+ * @brief 执行缓冲区中的待处理命令。
+ */
 static void execute_pending_command(void)
 {
 	if (cmd_len == 0U) {
@@ -515,6 +434,9 @@ static void execute_pending_command(void)
 	cmd_len = 0U;
 }
 
+/**
+ * @brief 轮询串口命令输入，支持换行触发与空闲超时触发。
+ */
 static void poll_uart_commands(void)
 {
 	unsigned char c;
@@ -586,6 +508,11 @@ static bool adv_has_xds_service(struct net_buf_simple *buf)
 	return matched;
 }
 
+/**
+ * @brief XDS 测量通知回调：解析原始 11 字节数据并更新全局状态。
+ *
+ * 踏频字段采用已验证格式：byte6 有符号值，负值视为反踩并归零。
+ */
 static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
 			   const void *data, uint16_t length)
 {
@@ -598,7 +525,6 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	uint16_t crank_angle_deg;
 	uint16_t cadence_calc;
 	uint8_t err_code;
-	bool changed;
 	uint32_t now;
 
 	ARG_UNUSED(conn);
@@ -625,7 +551,6 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	}
 
 	k_mutex_lock(&data_lock, K_FOREVER);
-	changed = (total_power != latest_power_w) || (cadence_calc != latest_cadence);
 	latest_power_w = total_power;
 	latest_left_power_w = left_power;
 	latest_right_power_w = right_power;
@@ -641,9 +566,6 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 		}
 	}
 	last_rx_packet_ms = now;
-	if (changed) {
-		last_data_change_ms = last_ble_data_ms;
-	}
 	pwr_event_count++;
 	accumulated_power = (uint16_t)(accumulated_power + total_power);
 	k_mutex_unlock(&data_lock);
@@ -726,6 +648,11 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 	return BT_GATT_ITER_STOP;
 }
 
+/**
+ * @brief 启动 BLE 扫描（中央角色），搜索 XDS 服务。
+ *
+ * @return 0 成功，其它为错误码。
+ */
 static int start_scan(void)
 {
 	int err;
@@ -749,6 +676,11 @@ static int start_scan(void)
 	return 0;
 }
 
+/**
+ * @brief 启动本机 BLE 外设广播（CPS+CSCS）。
+ *
+ * @return 0 成功，其它为错误码。
+ */
 static int start_advertising(void)
 {
 	int err;
@@ -773,6 +705,9 @@ static int start_advertising(void)
 	return 0;
 }
 
+/**
+ * @brief 扫描回调：发现目标设备后停止扫描并发起连接。
+ */
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
@@ -808,6 +743,9 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	LOG_INF("Connecting to XDS meter (RSSI %d)...", rssi);
 }
 
+/**
+ * @brief BLE 连接事件回调（中央/外设双角色共用）。
+ */
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	struct bt_conn_info info;
@@ -849,6 +787,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 }
 
+/**
+ * @brief BLE 断开事件回调，负责重连扫描与外设广播恢复。
+ */
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	struct bt_conn_info info;
@@ -868,6 +809,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		(void)start_scan();
 	} else {
 		ble_periph_connected = false;
+		/* 手机 APP 断开后必须立即恢复可连接广播，否则 APP 无法再次连接。 */
+		(void)start_advertising();
 	}
 }
 
@@ -955,6 +898,7 @@ static int profile_setup(void)
 		return err;
 	}
 
+
 	LOG_INF("ANT+ BPWR TX open: dev=%d type=11", CONFIG_BPWR_TX_CHAN_ID_DEV_NUM);
 	return 0;
 }
@@ -1009,6 +953,11 @@ static void set_leds(bool l0, bool l1, bool l2)
 	(void)gpio_pin_set_dt(&led2, l2);
 }
 
+/**
+ * @brief 更新三颗 LED 状态指示。
+ *
+ * LED2(P0.04): APP 已连接常亮，否则慢闪。
+ */
 static void update_led_pattern(void)
 {
 	uint32_t now = k_uptime_get_32();
@@ -1025,6 +974,14 @@ static void update_led_pattern(void)
 	set_leds(true, ant_led, ble_periph_connected ? true : slow_on);
 }
 
+/**
+ * @brief 将最新 BLE 数据映射到 ANT BPWR 发送结构。
+ *
+ * 包括功率、踏频与左右平衡字段，供码表通过 ANT+ 读取。
+ */
+/**
+ * @brief 将最新 BLE 数据映射到 ANT BPWR 页面字段。
+ */
 static void update_ant_from_latest_data(void)
 {
 	uint16_t pwr;
@@ -1070,6 +1027,9 @@ static void update_ant_from_latest_data(void)
 	bpwr.BPWR_PROFILE_accumulated_power = acc;
 }
 
+/**
+ * @brief 程序主入口：初始化 ANT/BLE 并执行桥接主循环。
+ */
 int main(void)
 {
 	int err;
