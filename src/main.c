@@ -34,6 +34,7 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
 #define CADENCE_MIN_STEP_DEG 2
 #define CADENCE_MAX_STEP_DEG 120
 #define CADENCE_COMP_X10 18
+#define APP_NOTIFY_INTERVAL_MS 200
 
 #define XDS_SERVICE_UUID_16 0x1828
 #define XDS_MEAS_UUID_16 0x2A63
@@ -74,6 +75,7 @@ static uint32_t rx_avg_interval_ms;
 static uint8_t pwr_event_count;
 static uint16_t accumulated_power;
 static bool cps_notify_enabled;
+static bool csc_notify_enabled;
 static bool cadence_state_valid;
 static uint16_t cadence_prev_angle_deg;
 static uint32_t cadence_prev_ms;
@@ -88,6 +90,11 @@ static bool ble_seen_sensor;
 static bool ble_connected_sensor;
 static bool ble_periph_connected;
 static bool ant_linked_display;
+static uint32_t cumulative_crank_revs;
+static uint16_t last_crank_event_time_1024;
+static uint32_t last_crank_update_ms;
+static uint32_t last_app_notify_ms;
+static uint32_t last_app_log_ms;
 
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad);
@@ -103,37 +110,92 @@ BPWR_SENS_PROFILE_CONFIG_DEF(bpwr, (ant_bpwr_torque_t)(CONFIG_SENSOR_TYPE), ant_
 static ant_bpwr_profile_t bpwr;
 
 static void cps_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
+static void csc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 static ssize_t read_cps_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				    void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_csc_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				    void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_csc_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset);
 
 BT_GATT_SERVICE_DEFINE(cps_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_CPS),
 	BT_GATT_CHARACTERISTIC(BT_UUID_GATT_CPS_CPM, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_READ, read_cps_measurement, NULL, NULL),
-	BT_GATT_CCC(cps_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE));
+	BT_GATT_CCC(cps_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CHARACTERISTIC(BT_UUID_GATT_CPS_CPF, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_cps_feature, NULL, NULL));
 
-static void build_cps_measurement(uint16_t power_w, uint8_t out[4])
+BT_GATT_SERVICE_DEFINE(csc_svc,
+	BT_GATT_PRIMARY_SERVICE(BT_UUID_CSC),
+	BT_GATT_CHARACTERISTIC(BT_UUID_CSC_MEASUREMENT, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ, read_csc_measurement, NULL, NULL),
+	BT_GATT_CCC(csc_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CHARACTERISTIC(BT_UUID_CSC_FEATURE, BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ, read_csc_feature, NULL, NULL));
+
+static void update_crank_metrics(uint16_t cadence_rpm, uint32_t now_ms)
 {
-	int16_t power_s16 = (power_w > INT16_MAX) ? INT16_MAX : (int16_t)power_w;
+	uint32_t per_rev_ms;
+	uint32_t elapsed;
+	uint16_t time_inc_1024;
 
-	/* Flags(2B) + Instantaneous Power(2B). */
-	sys_put_le16(0U, out);
-	sys_put_le16((uint16_t)power_s16, out + 2);
-}
-
-static void bridge_notify_cps_power(uint16_t power_w)
-{
-	uint8_t cpm[4];
-
-	if (!cps_notify_enabled) {
+	if (cadence_rpm == 0U) {
 		return;
 	}
 
-	build_cps_measurement(power_w, cpm);
-	(void)bt_gatt_notify(NULL, &cps_svc.attrs[2], cpm, sizeof(cpm));
+	if (last_crank_update_ms == 0U) {
+		last_crank_update_ms = now_ms;
+		return;
+	}
+
+	per_rev_ms = 60000U / cadence_rpm;
+	if (per_rev_ms == 0U) {
+		per_rev_ms = 1U;
+	}
+
+	elapsed = now_ms - last_crank_update_ms;
+	if (elapsed < per_rev_ms) {
+		return;
+	}
+
+	time_inc_1024 = (uint16_t)MAX(1U, (per_rev_ms * 1024U) / 1000U);
+	while (elapsed >= per_rev_ms) {
+		cumulative_crank_revs++;
+		last_crank_event_time_1024 = (uint16_t)(last_crank_event_time_1024 + time_inc_1024);
+		last_crank_update_ms += per_rev_ms;
+		elapsed -= per_rev_ms;
+	}
 }
 
-static uint16_t cadence_from_angle(uint16_t crank_angle_deg, uint32_t now_ms)
+static size_t build_cps_measurement(uint16_t power_w, uint16_t cadence_rpm, uint8_t out[8])
+{
+	int16_t power_s16 = (power_w > INT16_MAX) ? INT16_MAX : (int16_t)power_w;
+	uint16_t flags = BIT(5); /* Crank revolution data present. */
+	uint32_t now = k_uptime_get_32();
+
+	update_crank_metrics(cadence_rpm, now);
+	sys_put_le16(flags, out);
+	sys_put_le16((uint16_t)power_s16, out + 2);
+	sys_put_le16((uint16_t)cumulative_crank_revs, out + 4);
+	sys_put_le16(last_crank_event_time_1024, out + 6);
+	return 8U;
+}
+
+static size_t build_csc_measurement(uint16_t cadence_rpm, uint8_t out[5])
+{
+	uint32_t now = k_uptime_get_32();
+
+	update_crank_metrics(cadence_rpm, now);
+	out[0] = BIT(1); /* Crank data present. */
+	sys_put_le16((uint16_t)cumulative_crank_revs, out + 1);
+	sys_put_le16(last_crank_event_time_1024, out + 3);
+	return 5U;
+}
+
+static uint16_t __unused cadence_from_angle(uint16_t crank_angle_deg, uint32_t now_ms)
 {
 	uint32_t dt_ms;
 	uint16_t delta_cw;
@@ -208,21 +270,105 @@ static void print_cadence_cfg(void)
 static ssize_t read_cps_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				    void *buf, uint16_t len, uint16_t offset)
 {
-	uint8_t cpm[4];
+	uint8_t cpm[8];
 	uint16_t pwr;
+	uint16_t cad;
+	size_t cpm_len;
 
 	k_mutex_lock(&data_lock, K_FOREVER);
 	pwr = latest_power_w;
+	cad = latest_cadence;
 	k_mutex_unlock(&data_lock);
 
-	build_cps_measurement(pwr, cpm);
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, cpm, sizeof(cpm));
+	cpm_len = build_cps_measurement(pwr, cad, cpm);
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, cpm, cpm_len);
 }
 
 static void cps_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	ARG_UNUSED(attr);
 	cps_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
+}
+
+static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset)
+{
+	uint32_t features = BIT(3); /* Crank revolution data supported. */
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &features, sizeof(features));
+}
+
+static ssize_t read_csc_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				    void *buf, uint16_t len, uint16_t offset)
+{
+	uint8_t csc[5];
+	uint16_t cad;
+	size_t csc_len;
+
+	k_mutex_lock(&data_lock, K_FOREVER);
+	cad = latest_cadence;
+	k_mutex_unlock(&data_lock);
+
+	csc_len = build_csc_measurement(cad, csc);
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, csc, csc_len);
+}
+
+static void csc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	ARG_UNUSED(attr);
+	csc_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
+}
+
+static ssize_t read_csc_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				void *buf, uint16_t len, uint16_t offset)
+{
+	uint16_t features = BIT(1); /* Crank revolution data supported. */
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &features, sizeof(features));
+}
+
+static void notify_ble_apps_if_due(void)
+{
+	uint8_t cpm[8];
+	uint8_t csc[5];
+	uint16_t pwr;
+	uint16_t cad;
+	uint32_t now = k_uptime_get_32();
+	size_t cpm_len;
+	size_t csc_len;
+	bool any_notified = false;
+
+	if (!cps_notify_enabled && !csc_notify_enabled) {
+		return;
+	}
+
+	if ((now - last_app_notify_ms) < APP_NOTIFY_INTERVAL_MS) {
+		return;
+	}
+	last_app_notify_ms = now;
+
+	k_mutex_lock(&data_lock, K_FOREVER);
+	pwr = latest_power_w;
+	cad = latest_cadence;
+	k_mutex_unlock(&data_lock);
+
+	if (cps_notify_enabled) {
+		cpm_len = build_cps_measurement(pwr, cad, cpm);
+		(void)bt_gatt_notify(NULL, &cps_svc.attrs[2], cpm, cpm_len);
+		any_notified = true;
+	}
+
+	if (csc_notify_enabled) {
+		csc_len = build_csc_measurement(cad, csc);
+		(void)bt_gatt_notify(NULL, &csc_svc.attrs[2], csc, csc_len);
+		any_notified = true;
+	}
+
+	if (any_notified && (now - last_app_log_ms) >= 1000U) {
+		printf("APP TX P=%uW C=%urpm rev=%lu t=%u\n",
+		       pwr, cad, (unsigned long)cumulative_crank_revs, last_crank_event_time_1024);
+		last_app_log_ms = now;
+	}
 }
 
 static void print_status(void)
@@ -237,9 +383,9 @@ static void print_status(void)
 	if (rx_avg_interval_ms > 0U) {
 		hz_x10 = 10000U / rx_avg_interval_ms;
 	}
-	printf("status: seen=%d ble_conn=%d ant_link=%d ble_out=%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
+	printf("status: seen=%d ble_conn=%d ant_link=%d ble_out=%d/%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
 	       ble_seen_sensor, ble_connected_sensor, ant_linked_display,
-	       cps_notify_enabled, latest_power_w, latest_cadence, latest_error_code,
+	       cps_notify_enabled, csc_notify_enabled, latest_power_w, latest_cadence, latest_error_code,
 	       pwr_event_count, hz_x10 / 10U, hz_x10 % 10U, age_ms);
 	k_mutex_unlock(&data_lock);
 }
@@ -428,6 +574,7 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	uint16_t total_power;
 	int16_t left_power;
 	int16_t right_power;
+	int8_t raw_cadence_s8;
 	uint16_t angle_deg;
 	uint16_t crank_angle_deg;
 	uint16_t cadence_calc;
@@ -446,11 +593,17 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	total_power = sys_get_le16(raw + 0);
 	left_power = (int16_t)sys_get_le16(raw + 2);
 	right_power = (int16_t)sys_get_le16(raw + 4);
+	/* cpp2026042201.ino: byte6 is signed cadence, reverse pedaling appears as negative. */
+	raw_cadence_s8 = (int8_t)raw[6];
 	angle_deg = (uint16_t)(sys_get_le16(raw + 6) % 360U);
 	crank_angle_deg = (uint16_t)(sys_get_le16(raw + 8) % 360U);
 	err_code = raw[10];
 	now = k_uptime_get_32();
-	cadence_calc = cadence_from_angle(crank_angle_deg, now);
+	if (raw_cadence_s8 >= 0 && raw_cadence_s8 <= 200) {
+		cadence_calc = (uint16_t)raw_cadence_s8;
+	} else {
+		cadence_calc = 0U;
+	}
 
 	k_mutex_lock(&data_lock, K_FOREVER);
 	changed = (total_power != latest_power_w) || (cadence_calc != latest_cadence);
@@ -476,7 +629,6 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	accumulated_power = (uint16_t)(accumulated_power + total_power);
 	k_mutex_unlock(&data_lock);
 
-	bridge_notify_cps_power(total_power);
 	printf("RX P=%uW C=%urpm E=%u (L=%d R=%d A=%u CA=%u)\n",
 	       total_power, cadence_calc, err_code, left_power, right_power, angle_deg, crank_angle_deg);
 	return BT_GATT_ITER_CONTINUE;
@@ -581,7 +733,7 @@ static int start_advertising(void)
 		BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 		BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 			sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-		BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0x18, 0x18),
+		BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0x18, 0x18, 0x16, 0x18),
 	};
 
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), NULL, 0);
@@ -593,7 +745,7 @@ static int start_advertising(void)
 		return err;
 	}
 
-	LOG_INF("BLE peripheral advertising started (CPS 0x1818)");
+	LOG_INF("BLE peripheral advertising started (CPS+CSCS)");
 	return 0;
 }
 
@@ -668,6 +820,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		}
 	} else {
 		ble_periph_connected = true;
+		last_crank_update_ms = k_uptime_get_32();
 		LOG_INF("BLE app/phone connected to local CPS");
 	}
 }
@@ -872,8 +1025,8 @@ static void update_ant_from_latest_data(void)
 	k_mutex_unlock(&data_lock);
 
 	bpwr.BPWR_PROFILE_instantaneous_power = pwr;
-	/* Disable cadence field in ANT power profile (external cadence sensor is used). */
-	bpwr.BPWR_PROFILE_instantaneous_cadence = 0xFF;
+	/* Forward parsed cadence to ANT+ (0xFF is reserved as invalid). */
+	bpwr.BPWR_PROFILE_instantaneous_cadence = (cad > 254U) ? 254U : (uint8_t)cad;
 	if (use_live_data && left_w >= 0 && right_w >= 0) {
 		lr_sum = (uint32_t)left_w + (uint32_t)right_w;
 		if (lr_sum > 0U) {
@@ -935,8 +1088,11 @@ int main(void)
 
 	while (1) {
 		poll_uart_commands();
+		notify_ble_apps_if_due();
 		update_ant_from_latest_data();
 		update_led_pattern();
 		k_sleep(K_MSEC(50));
 	}
+
+	
 }
