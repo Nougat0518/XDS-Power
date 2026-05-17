@@ -1,0 +1,89 @@
+#
+# ANT+ BPWR transmitter options (based on sdk-ant bpwr_tx sample).
+#
+
+source "Kconfig.zephyr"
+
+menuconfig BPWR_TX
+	bool "ANT+ Bicycle Power TX"
+	select ANT
+	select ANT_BPWR
+	select ANT_BPWR_SIMULATOR
+	select ANT_KEY_MANAGER
+	select ANT_CHANNEL_CONFIG
+	default y
+
+menu "Channel configuration"
+
+config BPWR_TX_CHANNEL_NUM
+	int "Channel number"
+	default 0
+
+config BPWR_TX_NETWORK_NUM
+	int "ANT+ network number"
+	default 0
+
+config BPWR_TX_CHAN_ID_DEV_NUM
+	int "Device number"
+	default 49
+	range 0 65535
+
+config BPWR_TX_CHAN_ID_TRANS_TYPE
+	int "Transmission type"
+	default 5
+	range 0 255
+
+config BPWR_TX_CALIBRATION_DATA
+	int "Calibration data"
+	default 21930
+
+endmenu
+
+menu "Product information"
+
+config BPWR_TX_HW_VERSION
+	int "Hardware revision"
+	default 5
+
+config BPWR_TX_MFG_ID
+	int "Manufacturer ID"
+	default 2
+
+config BPWR_TX_MODEL_NUM
+	int "Model number"
+	default 2
+
+config BPWR_TX_SW_VERSION
+	int "Software version"
+	default 0
+
+config BPWR_TX_SERIAL_NUM
+	int "Serial number"
+	default 43981
+
+endmenu
+
+menu "User interface"
+
+choice BPWR_TX_MODIFICATION_TYPE
+	default UPDATE_AUTO
+	prompt "Power value update mode"
+
+config UPDATE_AUTO
+	bool "Automatic sweep"
+
+config UPDATE_MANUAL
+	bool "Manual (requires board buttons)"
+
+endchoice
+
+menu "Bicycle power sensor"
+
+config SENSOR_TYPE
+	int "Sensor type (1=power, 2=wheel torque, 3=crank torque)"
+	default 1
+	range 1 3
+
+endmenu
+
+endmenu

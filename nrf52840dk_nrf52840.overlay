@@ -1,0 +1,23 @@
+/ {
+	aliases {
+		led0 = &user_led0;
+		led1 = &user_led1;
+		led2 = &user_led2;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		user_led0: user_led0 {
+			gpios = <&gpio0 12 GPIO_ACTIVE_LOW>;
+			label = "User LED P0.12";
+		};
+		user_led1: user_led1 {
+			gpios = <&gpio1 9 GPIO_ACTIVE_LOW>;
+			label = "User LED P1.09";
+		};
+		user_led2: user_led2 {
+			gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+			label = "User LED P0.04";
+		};
+	};
+};
