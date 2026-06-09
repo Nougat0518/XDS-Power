@@ -128,6 +128,26 @@ static uint32_t last_app_log_ms;
 /** @brief 上次 RX 日志时间戳（ms）。 */
 static uint32_t last_rx_log_ms;
 
+/**
+ * @brief BLE 外设广播数据（放服务与外观）。
+ *
+ * 说明：
+ * - 将设备名移到扫描响应，降低首包长度，提升不同手机/手表扫描器的兼容性。
+ * - 使用 UUID16_SOME（而非 ALL）避免被客户端严格按“完整列表”校验时误判。
+ */
+static const struct bt_data adv_ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, BT_UUID_16_ENCODE(BT_APPEARANCE_CYCLING_POWER)),
+	BT_DATA_BYTES(BT_DATA_UUID16_SOME,
+		      BT_UUID_16_ENCODE(BT_UUID_CPS_VAL),
+		      BT_UUID_16_ENCODE(BT_UUID_CSC_VAL)),
+};
+
+/** @brief BLE 外设扫描响应数据（放完整设备名）。 */
+static const struct bt_data adv_sd[] = {
+	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad);
 
@@ -143,21 +163,18 @@ static ant_bpwr_profile_t bpwr;
 
 static void cps_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 static void csc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
-static ssize_t read_cps_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-				    void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_sensor_location(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-				    void *buf, uint16_t len, uint16_t offset);
-static ssize_t read_csc_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				    void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_csc_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				void *buf, uint16_t len, uint16_t offset);
 
 BT_GATT_SERVICE_DEFINE(cps_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_CPS),
-	BT_GATT_CHARACTERISTIC(BT_UUID_GATT_CPS_CPM, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-			       BT_GATT_PERM_READ, read_cps_measurement, NULL, NULL),
+	/* Measurement 按规范使用 Notify，避免客户端因可读属性判定为非标准实现。 */
+	BT_GATT_CHARACTERISTIC(BT_UUID_GATT_CPS_CPM, BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
 	BT_GATT_CCC(cps_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 	BT_GATT_CHARACTERISTIC(BT_UUID_GATT_CPS_CPF, BT_GATT_CHRC_READ,
 			       BT_GATT_PERM_READ, read_cps_feature, NULL, NULL),
@@ -166,8 +183,8 @@ BT_GATT_SERVICE_DEFINE(cps_svc,
 
 BT_GATT_SERVICE_DEFINE(csc_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_CSC),
-	BT_GATT_CHARACTERISTIC(BT_UUID_CSC_MEASUREMENT, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-			       BT_GATT_PERM_READ, read_csc_measurement, NULL, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_CSC_MEASUREMENT, BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
 	BT_GATT_CCC(csc_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 	BT_GATT_CHARACTERISTIC(BT_UUID_CSC_FEATURE, BT_GATT_CHRC_READ,
 			       BT_GATT_PERM_READ, read_csc_feature, NULL, NULL),
@@ -256,23 +273,6 @@ static size_t build_csc_measurement(uint16_t cadence_rpm, uint8_t out[5])
 	return 5U;
 }
 
-static ssize_t read_cps_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-				    void *buf, uint16_t len, uint16_t offset)
-{
-	uint8_t cpm[8];
-	uint16_t pwr;
-	uint16_t cad;
-	size_t cpm_len;
-
-	k_mutex_lock(&data_lock, K_FOREVER);
-	pwr = latest_power_w;
-	cad = latest_cadence;
-	k_mutex_unlock(&data_lock);
-
-	cpm_len = build_cps_measurement(pwr, cad, cpm);
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, cpm, cpm_len);
-}
-
 static void cps_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	ARG_UNUSED(attr);
@@ -294,21 +294,6 @@ static ssize_t read_sensor_location(struct bt_conn *conn, const struct bt_gatt_a
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset,
 				 &sensor_location, sizeof(sensor_location));
-}
-
-static ssize_t read_csc_measurement(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-				    void *buf, uint16_t len, uint16_t offset)
-{
-	uint8_t csc[5];
-	uint16_t cad;
-	size_t csc_len;
-
-	k_mutex_lock(&data_lock, K_FOREVER);
-	cad = latest_cadence;
-	k_mutex_unlock(&data_lock);
-
-	csc_len = build_csc_measurement(cad, csc);
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, csc, csc_len);
 }
 
 static void csc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
@@ -684,15 +669,10 @@ static int start_scan(void)
 static int start_advertising(void)
 {
 	int err;
-	const struct bt_data ad[] = {
-		BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-		BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
-			sizeof(CONFIG_BT_DEVICE_NAME) - 1),
-		BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, BT_UUID_16_ENCODE(BT_APPEARANCE_CYCLING_POWER)),
-		BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0x18, 0x18, 0x16, 0x18),
-	};
 
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), NULL, 0);
+	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
+			      adv_ad, ARRAY_SIZE(adv_ad),
+			      adv_sd, ARRAY_SIZE(adv_sd));
 	if (err == -EALREADY) {
 		return 0;
 	}
@@ -752,12 +732,16 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	if (err) {
 		LOG_ERR("BLE connect failed (%u)", err);
-		if (sensor_conn) {
+		/* 仅当失败的是中央侧（连 XDS）对象时，才清理 sensor_conn。 */
+		if (sensor_conn && conn == sensor_conn) {
 			bt_conn_unref(sensor_conn);
 			sensor_conn = NULL;
+			ble_connected_sensor = false;
+			(void)start_scan();
+		} else {
+			/* 外设侧连接失败时，确保仍可被后续 APP/手表发现。 */
+			(void)start_advertising();
 		}
-		ble_connected_sensor = false;
-		(void)start_scan();
 		return;
 	}
 
