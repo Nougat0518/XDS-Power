@@ -26,16 +26,22 @@
 
 LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_WRN);
 
-/** @brief BLE 数据超时阈值（ms），超时后 ANT 输出清零。 */
-#define DATA_TIMEOUT_MS 5000
+/** @brief BLE/ANT 数据超时（ms），约 2 个 XDS 包周期，停脚后尽快清零。 */
+#define DATA_TIMEOUT_MS 2200
+/** @brief ANT profile 刷新周期（ms），与 BPWR 广播 ~4Hz 对齐。 */
+#define ANT_UPDATE_MS 250
+/** @brief 主循环周期（ms）。 */
+#define MAIN_LOOP_MS 25
 /** @brief 慢闪半周期（ms），用于状态指示灯闪烁节奏。 */
 #define SLOW_BLINK_HALF_MS 250
 /** @brief 串口接收数据日志输出周期（ms）。 */
 #define RX_LOG_INTERVAL_MS 1000
 /** @brief APP 转发日志输出周期（ms）。 */
 #define APP_LOG_INTERVAL_MS 2000
-/** @brief BLE APP 通知发送周期（ms）。 */
-#define APP_NOTIFY_INTERVAL_MS 200
+/** @brief BLE APP 通知发送周期（ms，XDS 原生约 1Hz）。 */
+#define APP_NOTIFY_INTERVAL_MS 1000
+/** @brief 中央侧（连接 XDS）监督超时（ms），放宽以避免停脚时误断链。 */
+#define XDS_CONN_TIMEOUT_MS 12000
 
 /** @brief XDS 功率计服务 UUID（16-bit）。 */
 #define XDS_SERVICE_UUID_16 0x1828
@@ -66,6 +72,19 @@ static char cmd_buf[CMD_BUF_LEN];
 static size_t cmd_len;
 /** @brief 串口最后一次接收字符时间戳（ms）。 */
 static uint32_t cmd_last_rx_ms;
+
+/** @brief 串口调试打印总开关，默认关闭以减轻 UART 占用与回调延迟。 */
+static bool serial_log_enabled;
+
+#define SLOG(...)                                                                                  \
+	do {                                                                                       \
+		if (serial_log_enabled) {                                                              \
+			printf(__VA_ARGS__);                                                           \
+		}                                                                                      \
+	} while (0)
+
+/** @brief 上次 ANT profile 刷新时间戳（ms）。 */
+static uint32_t last_ant_update_ms;
 
 /** @brief 当前与 XDS 连接对象（中央角色）。 */
 static struct bt_conn *sensor_conn;
@@ -163,6 +182,8 @@ static ant_bpwr_profile_t bpwr;
 
 static void cps_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 static void csc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
+static void update_ant_from_latest_data(bool bump_evt_on_tick);
+static void notify_ble_apps_from_cache(void);
 static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_sensor_location(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -311,20 +332,73 @@ static ssize_t read_csc_feature(struct bt_conn *conn, const struct bt_gatt_attr 
 }
 
 /**
- * @brief 按固定节拍向已订阅的 APP 发送 CPS/CSCS 通知。
- *
- * 为降低 CPU 与链路开销，统一限频到 APP_NOTIFY_INTERVAL_MS。
+ * @brief 将缓存数据立即转发给已订阅的 APP（每包 XDS 数据调用一次，~1Hz）。
  */
-static void notify_ble_apps_if_due(void)
+static void notify_ble_apps_from_cache(void)
 {
 	uint8_t cpm[8];
-	uint8_t csc[5];
 	uint16_t pwr;
 	uint16_t cad;
 	uint32_t now = k_uptime_get_32();
 	size_t cpm_len;
-	size_t csc_len;
+	bool use_live_data;
 	bool any_notified = false;
+
+	if (!cps_notify_enabled && !csc_notify_enabled) {
+		return;
+	}
+
+	k_mutex_lock(&data_lock, K_FOREVER);
+	use_live_data = ble_connected_sensor && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
+	pwr = use_live_data ? latest_power_w : 0U;
+	cad = use_live_data ? latest_cadence : 0U;
+	k_mutex_unlock(&data_lock);
+
+	if (!use_live_data) {
+		return;
+	}
+
+	if (cps_notify_enabled) {
+		cpm_len = build_cps_measurement(pwr, cad, cpm);
+		(void)bt_gatt_notify(NULL, &cps_svc.attrs[2], cpm, cpm_len);
+		any_notified = true;
+	}
+
+	if (!ant_linked_display && csc_notify_enabled) {
+		uint8_t csc[5];
+		size_t csc_len = build_csc_measurement(cad, csc);
+
+		(void)bt_gatt_notify(NULL, &csc_svc.attrs[2], csc, csc_len);
+		any_notified = true;
+	}
+
+	if (any_notified && (now - last_app_log_ms) >= APP_LOG_INTERVAL_MS) {
+		SLOG("APP TX P=%uW C=%urpm rev=%lu t=%u\n", pwr, cad,
+		     (unsigned long)cumulative_crank_revs, last_crank_event_time_1024);
+		last_app_log_ms = now;
+	}
+}
+
+/**
+ * @brief 按 ~4Hz 节拍刷新 ANT profile（主循环调用）。
+ */
+static void ant_update_if_due(void)
+{
+	uint32_t now = k_uptime_get_32();
+
+	if ((now - last_ant_update_ms) < ANT_UPDATE_MS) {
+		return;
+	}
+	last_ant_update_ms = now;
+	update_ant_from_latest_data(true);
+}
+
+/**
+ * @brief 按固定节拍向已订阅的 APP 发送 CPS/CSCS 通知（兜底，正常由 XDS 包触发）。
+ */
+static void notify_ble_apps_if_due(void)
+{
+	uint32_t now = k_uptime_get_32();
 
 	if (!cps_notify_enabled && !csc_notify_enabled) {
 		return;
@@ -334,29 +408,7 @@ static void notify_ble_apps_if_due(void)
 		return;
 	}
 	last_app_notify_ms = now;
-
-	k_mutex_lock(&data_lock, K_FOREVER);
-	pwr = latest_power_w;
-	cad = latest_cadence;
-	k_mutex_unlock(&data_lock);
-
-	if (cps_notify_enabled) {
-		cpm_len = build_cps_measurement(pwr, cad, cpm);
-		(void)bt_gatt_notify(NULL, &cps_svc.attrs[2], cpm, cpm_len);
-		any_notified = true;
-	}
-
-	if (csc_notify_enabled) {
-		csc_len = build_csc_measurement(cad, csc);
-		(void)bt_gatt_notify(NULL, &csc_svc.attrs[2], csc, csc_len);
-		any_notified = true;
-	}
-
-	if (any_notified && (now - last_app_log_ms) >= APP_LOG_INTERVAL_MS) {
-		printf("APP TX P=%uW C=%urpm rev=%lu t=%u\n",
-		       pwr, cad, (unsigned long)cumulative_crank_revs, last_crank_event_time_1024);
-		last_app_log_ms = now;
-	}
+	notify_ble_apps_from_cache();
 }
 
 /**
@@ -374,9 +426,10 @@ static void print_status(void)
 	if (rx_avg_interval_ms > 0U) {
 		hz_x10 = 10000U / rx_avg_interval_ms;
 	}
-	printf("status: seen=%d ble_conn=%d ant_link=%d ble_out=%d/%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
+	printf("status: seen=%d ble_conn=%d ant_link=%d ble_out=%d/%d log=%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
 	       ble_seen_sensor, ble_connected_sensor, ant_linked_display,
-	       cps_notify_enabled, csc_notify_enabled, latest_power_w, latest_cadence, latest_error_code,
+	       cps_notify_enabled, csc_notify_enabled, serial_log_enabled,
+	       latest_power_w, latest_cadence, latest_error_code,
 	       pwr_event_count, hz_x10 / 10U, hz_x10 % 10U, age_ms);
 	k_mutex_unlock(&data_lock);
 }
@@ -389,7 +442,17 @@ static void print_status(void)
 static void handle_command(const char *cmd)
 {
 	if (strcmp(cmd, "help") == 0) {
-		printf("commands: help, status, scan\n");
+		printf("commands: help, status, scan, log on, log off\n");
+		return;
+	}
+	if (strcmp(cmd, "log on") == 0) {
+		serial_log_enabled = true;
+		printf("serial log enabled\n");
+		return;
+	}
+	if (strcmp(cmd, "log off") == 0) {
+		serial_log_enabled = false;
+		printf("serial log disabled\n");
 		return;
 	}
 	if (strcmp(cmd, "status") == 0) {
@@ -506,6 +569,7 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	int16_t left_power;
 	int16_t right_power;
 	int8_t raw_cadence_s8;
+	uint8_t raw_cadence_u8;
 	uint16_t angle_deg;
 	uint16_t crank_angle_deg;
 	uint16_t cadence_calc;
@@ -525,12 +589,16 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	right_power = (int16_t)sys_get_le16(raw + 4);
 	/* cpp2026042201.ino: byte6 is signed cadence, reverse pedaling appears as negative. */
 	raw_cadence_s8 = (int8_t)raw[6];
+	raw_cadence_u8 = raw[6];
 	angle_deg = (uint16_t)(sys_get_le16(raw + 6) % 360U);
 	crank_angle_deg = (uint16_t)(sys_get_le16(raw + 8) % 360U);
 	err_code = raw[10];
 	now = k_uptime_get_32();
 	if (raw_cadence_s8 >= 0 && raw_cadence_s8 <= 200) {
 		cadence_calc = (uint16_t)raw_cadence_s8;
+	} else if (raw_cadence_u8 <= 200U) {
+		/* 某些固件版本以无符号 byte6 上报踏频。 */
+		cadence_calc = (uint16_t)raw_cadence_u8;
 	} else {
 		cadence_calc = 0U;
 	}
@@ -546,19 +614,25 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 		uint32_t delta = now - last_rx_packet_ms;
 
 		if (delta > 0U && delta < DATA_TIMEOUT_MS) {
+			uint32_t acc_inc = ((uint32_t)total_power * delta * 4U) / 1000U;
+
 			rx_avg_interval_ms = (rx_avg_interval_ms == 0U) ? delta :
 					      ((rx_avg_interval_ms * 7U) + delta) / 8U;
+			accumulated_power = (uint16_t)(accumulated_power + acc_inc);
 		}
 	}
 	last_rx_packet_ms = now;
 	pwr_event_count++;
-	accumulated_power = (uint16_t)(accumulated_power + total_power);
 	k_mutex_unlock(&data_lock);
 
+	update_ant_from_latest_data(false);
+	notify_ble_apps_from_cache();
+	last_ant_update_ms = k_uptime_get_32();
+
 	if ((now - last_rx_log_ms) >= RX_LOG_INTERVAL_MS) {
-		printf("RX P=%uW C=%urpm E=%u (L=%d R=%d A=%u CA=%u)\n",
-		       total_power, cadence_calc, err_code, left_power, right_power, angle_deg,
-		       crank_angle_deg);
+		SLOG("RX P=%uW C=%urpm E=%u (L=%d R=%d A=%u CA=%u B6=0x%02X)\n",
+		     total_power, cadence_calc, err_code, left_power, right_power, angle_deg,
+		     crank_angle_deg, raw_cadence_u8);
 		last_rx_log_ms = now;
 	}
 	return BT_GATT_ITER_CONTINUE;
@@ -669,8 +743,14 @@ static int start_scan(void)
 static int start_advertising(void)
 {
 	int err;
+	struct bt_le_adv_param adv_param = {
+		.options = BT_LE_ADV_OPT_CONN,
+		.interval_min = 0x00a0U, /* 100 ms */
+		.interval_max = 0x00f0U, /* 150 ms */
+		.peer = NULL,
+	};
 
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
+	err = bt_le_adv_start(&adv_param,
 			      adv_ad, ARRAY_SIZE(adv_ad),
 			      adv_sd, ARRAY_SIZE(adv_sd));
 	if (err == -EALREADY) {
@@ -695,7 +775,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	struct bt_conn_le_create_param create_param = BT_CONN_LE_CREATE_PARAM_INIT(
 		BT_CONN_LE_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_INTERVAL);
 	struct bt_le_conn_param conn_param = BT_LE_CONN_PARAM_INIT(
-		BT_GAP_INIT_CONN_INT_MIN, BT_GAP_INIT_CONN_INT_MAX, 0, BT_GAP_MS_TO_CONN_TIMEOUT(4000));
+		48, 72, 0, BT_GAP_MS_TO_CONN_TIMEOUT(XDS_CONN_TIMEOUT_MS));
 
 	ARG_UNUSED(rssi);
 	ARG_UNUSED(type);
@@ -750,8 +830,16 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 
 	if (info.role == BT_CONN_ROLE_CENTRAL) {
+		struct bt_le_conn_param xds_param =
+			BT_LE_CONN_PARAM_INIT(48, 72, 0, BT_GAP_MS_TO_CONN_TIMEOUT(XDS_CONN_TIMEOUT_MS));
+		int perr;
+
 		ble_connected_sensor = true;
 		LOG_INF("BLE connected to XDS");
+		perr = bt_conn_le_param_update(conn, &xds_param);
+		if (perr && perr != -EALREADY) {
+			LOG_WRN("XDS conn param update failed (%d)", perr);
+		}
 
 		discover_uuid.uuid.type = BT_UUID_TYPE_16;
 		discover_uuid.val = XDS_SERVICE_UUID_16;
@@ -765,8 +853,17 @@ static void connected(struct bt_conn *conn, uint8_t err)
 			LOG_ERR("Primary service discover failed");
 		}
 	} else {
+		/* APP 连接后请求更慢连接参数，优先保障 ANT+ 连续性。 */
+		struct bt_le_conn_param app_param =
+			BT_LE_CONN_PARAM_INIT(80, 120, 4, BT_GAP_MS_TO_CONN_TIMEOUT(6000));
+		int perr;
+
 		ble_periph_connected = true;
 		last_crank_update_ms = k_uptime_get_32();
+		perr = bt_conn_le_param_update(conn, &app_param);
+		if (perr && perr != -EALREADY) {
+			LOG_WRN("BLE app conn param update failed (%d)", perr);
+		}
 		LOG_INF("BLE app/phone connected to local CPS");
 	}
 }
@@ -966,7 +1063,7 @@ static void update_led_pattern(void)
 /**
  * @brief 将最新 BLE 数据映射到 ANT BPWR 页面字段。
  */
-static void update_ant_from_latest_data(void)
+static void update_ant_from_latest_data(bool bump_evt_on_tick)
 {
 	uint16_t pwr;
 	uint16_t cad;
@@ -981,6 +1078,9 @@ static void update_ant_from_latest_data(void)
 
 	k_mutex_lock(&data_lock, K_FOREVER);
 	use_live_data = ble_connected_sensor && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
+	if (bump_evt_on_tick && use_live_data) {
+		pwr_event_count++;
+	}
 	pwr = use_live_data ? latest_power_w : 0U;
 	cad = use_live_data ? latest_cadence : 0U;
 	left_w = use_live_data ? latest_left_power_w : 0;
@@ -1052,14 +1152,14 @@ int main(void)
 	}
 
 	LOG_INF("Bridge running: BLE(XDS) -> ANT + BLE(CPS)");
-	printf("Type 'help' for commands.\n");
+	printf("Type 'help' for commands (log off by default).\n");
 
 	while (1) {
 		poll_uart_commands();
 		notify_ble_apps_if_due();
-		update_ant_from_latest_data();
+		ant_update_if_due();
 		update_led_pattern();
-		k_sleep(K_MSEC(50));
+		k_sleep(K_MSEC(MAIN_LOOP_MS));
 	}
 
 	
