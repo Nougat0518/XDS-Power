@@ -42,6 +42,18 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_WRN);
 #define APP_NOTIFY_INTERVAL_MS 1000
 /** @brief 中央侧（连接 XDS）监督超时（ms），放宽以避免停脚时误断链。 */
 #define XDS_CONN_TIMEOUT_MS 12000
+/* Faster advertising helps watches find the bridge in crowded BLE environments. */
+#define APP_ADV_INTERVAL_MIN 0x0030U /* 30 ms, units of 0.625 ms */
+#define APP_ADV_INTERVAL_MAX 0x0060U /* 60 ms, units of 0.625 ms */
+#define APP_ADV_WATCHDOG_MS 3000
+/* Keep the watch connection tighter than the old 100-150 ms / latency 4 setting. */
+#define APP_CONN_INTERVAL_MIN 36 /* 45 ms, units of 1.25 ms */
+#define APP_CONN_INTERVAL_MAX 48 /* 60 ms, units of 1.25 ms */
+#define APP_CONN_LATENCY 0
+#define APP_CONN_TIMEOUT_MS 8000
+/* Scan in bursts so central scanning does not starve advertising/ANT in busy areas. */
+#define XDS_SCAN_ON_MS 5000
+#define XDS_SCAN_OFF_MS 1000
 
 /** @brief XDS 功率计服务 UUID（16-bit）。 */
 #define XDS_SERVICE_UUID_16 0x1828
@@ -85,6 +97,8 @@ static bool serial_log_enabled;
 
 /** @brief 上次 ANT profile 刷新时间戳（ms）。 */
 static uint32_t last_ant_update_ms;
+static uint32_t last_adv_watchdog_ms;
+static uint32_t last_xds_scan_state_ms;
 
 /** @brief 当前与 XDS 连接对象（中央角色）。 */
 static struct bt_conn *sensor_conn;
@@ -132,6 +146,8 @@ static bool ble_seen_sensor;
 static bool ble_connected_sensor;
 /** @brief 是否有手机 APP 连接到本机外设。 */
 static bool ble_periph_connected;
+static bool ble_adv_active;
+static bool xds_scan_active;
 /** @brief 是否检测到 ANT 码表已链路建立。 */
 static bool ant_linked_display;
 /** @brief 累计曲柄转数（供 CPS/CSCS）。 */
@@ -184,6 +200,10 @@ static void cps_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 static void csc_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 static void update_ant_from_latest_data(bool bump_evt_on_tick);
 static void notify_ble_apps_from_cache(void);
+static int start_scan(void);
+static int stop_scan(void);
+static int start_advertising(void);
+static void maintain_ble_links(void);
 static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_sensor_location(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -354,10 +374,6 @@ static void notify_ble_apps_from_cache(void)
 	cad = use_live_data ? latest_cadence : 0U;
 	k_mutex_unlock(&data_lock);
 
-	if (!use_live_data) {
-		return;
-	}
-
 	if (cps_notify_enabled) {
 		cpm_len = build_cps_measurement(pwr, cad, cpm);
 		(void)bt_gatt_notify(NULL, &cps_svc.attrs[2], cpm, cpm_len);
@@ -412,6 +428,33 @@ static void notify_ble_apps_if_due(void)
 }
 
 /**
+ * @brief Maintain BLE advertising and burst scanning state.
+ */
+static void maintain_ble_links(void)
+{
+	uint32_t now = k_uptime_get_32();
+
+	if (!ble_periph_connected &&
+	    (!ble_adv_active || (now - last_adv_watchdog_ms) >= APP_ADV_WATCHDOG_MS)) {
+		last_adv_watchdog_ms = now;
+		(void)start_advertising();
+	}
+
+	if (sensor_conn || ble_connected_sensor) {
+		return;
+	}
+
+	if (xds_scan_active) {
+		if ((now - last_xds_scan_state_ms) >= XDS_SCAN_ON_MS) {
+			(void)stop_scan();
+		}
+	} else if (last_xds_scan_state_ms == 0U ||
+		   (now - last_xds_scan_state_ms) >= XDS_SCAN_OFF_MS) {
+		(void)start_scan();
+	}
+}
+
+/**
  * @brief 打印当前桥接状态（串口命令 status）。
  */
 static void print_status(void)
@@ -426,8 +469,9 @@ static void print_status(void)
 	if (rx_avg_interval_ms > 0U) {
 		hz_x10 = 10000U / rx_avg_interval_ms;
 	}
-	printf("status: seen=%d ble_conn=%d ant_link=%d ble_out=%d/%d log=%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
+	printf("status: seen=%d ble_conn=%d ant_link=%d app=%d adv=%d scan=%d ble_out=%d/%d log=%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
 	       ble_seen_sensor, ble_connected_sensor, ant_linked_display,
+	       ble_periph_connected, ble_adv_active, xds_scan_active,
 	       cps_notify_enabled, csc_notify_enabled, serial_log_enabled,
 	       latest_power_w, latest_cadence, latest_error_code,
 	       pwr_event_count, hz_x10 / 10U, hz_x10 % 10U, age_ms);
@@ -460,8 +504,8 @@ static void handle_command(const char *cmd)
 		return;
 	}
 	if (strcmp(cmd, "scan") == 0) {
-		(void)bt_le_scan_stop();
-		(void)bt_le_scan_start(BT_LE_SCAN_ACTIVE, device_found);
+		(void)stop_scan();
+		(void)start_scan();
 		printf("scan restart requested\n");
 		return;
 	}
@@ -722,16 +766,40 @@ static int start_scan(void)
 		.window = BT_GAP_SCAN_FAST_WINDOW / 2,
 	};
 
+	if (sensor_conn || ble_connected_sensor) {
+		xds_scan_active = false;
+		return 0;
+	}
+
 	err = bt_le_scan_start(&param, device_found);
 	if (err == -EALREADY) {
+		xds_scan_active = true;
+		last_xds_scan_state_ms = k_uptime_get_32();
 		return 0;
 	}
 	if (err) {
+		xds_scan_active = false;
 		LOG_ERR("Scan start failed (%d)", err);
 		return err;
 	}
 
+	xds_scan_active = true;
+	last_xds_scan_state_ms = k_uptime_get_32();
 	LOG_INF("BLE scanning for XDS service (0x1828)");
+	return 0;
+}
+
+static int stop_scan(void)
+{
+	int err = bt_le_scan_stop();
+
+	if (err && err != -EALREADY) {
+		LOG_WRN("Scan stop failed (%d)", err);
+		return err;
+	}
+
+	xds_scan_active = false;
+	last_xds_scan_state_ms = k_uptime_get_32();
 	return 0;
 }
 
@@ -745,22 +813,32 @@ static int start_advertising(void)
 	int err;
 	struct bt_le_adv_param adv_param = {
 		.options = BT_LE_ADV_OPT_CONN,
-		.interval_min = 0x00a0U, /* 100 ms */
-		.interval_max = 0x00f0U, /* 150 ms */
+		.interval_min = APP_ADV_INTERVAL_MIN,
+		.interval_max = APP_ADV_INTERVAL_MAX,
 		.peer = NULL,
 	};
+
+	if (ble_periph_connected) {
+		ble_adv_active = false;
+		return 0;
+	}
 
 	err = bt_le_adv_start(&adv_param,
 			      adv_ad, ARRAY_SIZE(adv_ad),
 			      adv_sd, ARRAY_SIZE(adv_sd));
 	if (err == -EALREADY) {
+		ble_adv_active = true;
+		last_adv_watchdog_ms = k_uptime_get_32();
 		return 0;
 	}
 	if (err) {
+		ble_adv_active = false;
 		LOG_ERR("Adv start failed (%d)", err);
 		return err;
 	}
 
+	ble_adv_active = true;
+	last_adv_watchdog_ms = k_uptime_get_32();
 	LOG_INF("BLE peripheral advertising started (CPS+CSCS)");
 	return 0;
 }
@@ -786,9 +864,8 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 	ble_seen_sensor = true;
 
-	err = bt_le_scan_stop();
+	err = stop_scan();
 	if (err && err != -EALREADY) {
-		LOG_ERR("Stop scan failed (%d)", err);
 		return;
 	}
 
@@ -834,6 +911,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 			BT_LE_CONN_PARAM_INIT(48, 72, 0, BT_GAP_MS_TO_CONN_TIMEOUT(XDS_CONN_TIMEOUT_MS));
 		int perr;
 
+		xds_scan_active = false;
 		ble_connected_sensor = true;
 		LOG_INF("BLE connected to XDS");
 		perr = bt_conn_le_param_update(conn, &xds_param);
@@ -853,12 +931,15 @@ static void connected(struct bt_conn *conn, uint8_t err)
 			LOG_ERR("Primary service discover failed");
 		}
 	} else {
-		/* APP 连接后请求更慢连接参数，优先保障 ANT+ 连续性。 */
+		/* APP/watch connections use tighter parameters for outdoor stability. */
 		struct bt_le_conn_param app_param =
-			BT_LE_CONN_PARAM_INIT(80, 120, 4, BT_GAP_MS_TO_CONN_TIMEOUT(6000));
+			BT_LE_CONN_PARAM_INIT(APP_CONN_INTERVAL_MIN, APP_CONN_INTERVAL_MAX,
+					      APP_CONN_LATENCY,
+					      BT_GAP_MS_TO_CONN_TIMEOUT(APP_CONN_TIMEOUT_MS));
 		int perr;
 
 		ble_periph_connected = true;
+		ble_adv_active = false;
 		last_crank_update_ms = k_uptime_get_32();
 		perr = bt_conn_le_param_update(conn, &app_param);
 		if (perr && perr != -EALREADY) {
@@ -890,6 +971,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		(void)start_scan();
 	} else {
 		ble_periph_connected = false;
+		ble_adv_active = false;
 		/* 手机 APP 断开后必须立即恢复可连接广播，否则 APP 无法再次连接。 */
 		(void)start_advertising();
 	}
@@ -1156,6 +1238,7 @@ int main(void)
 
 	while (1) {
 		poll_uart_commands();
+		maintain_ble_links();
 		notify_ble_apps_if_due();
 		ant_update_if_due();
 		update_led_pattern();

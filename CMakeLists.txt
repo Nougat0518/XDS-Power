@@ -13,6 +13,11 @@ if(DEFINED ENV{ZEPHYR_BASE})
 	list(APPEND _ncs_roots "${_zephyr_parent}")
 endif()
 
+# nRF Connect for VS Code does not always export WEST_TOPDIR/ZEPHYR_BASE
+# before this application CMake file is evaluated. Keep the installed NCS
+# location as a fallback for the manually installed sdk-ant add-on.
+list(APPEND _ncs_roots "G:/ncs/v3.2.4")
+
 set(_ant_module_path "")
 list(REMOVE_DUPLICATES _ncs_roots)
 foreach(_root IN LISTS _ncs_roots)
